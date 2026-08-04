@@ -1,97 +1,594 @@
 /**
- * Pi Notify Extension
+ * 负责 Pi agent 完成时的桌面通知扩展入口与对外 API
  *
- * Sends a native terminal notification when Pi agent is done and waiting for input.
- * Supports multiple terminal protocols:
- * - OSC 777: Ghostty, WezTerm, rxvt-unicode
- * - OSC 9: iTerm2
- * - OSC 99: Kitty
- * - tmux passthrough wrapper for OSC notifications
- * - Windows toast: Windows Terminal (WSL)
- * - Optional sound hook via PI_NOTIFY_SOUND_CMD
+ * Desktop notifications when the agent settles and is waiting for input.
+ * Delivery: OSC 777/9/99, tmux passthrough, Windows toast (+ logo.png).
+ * Policy: streaming-aware suppression, cooldown, optional focus hook, manual pause.
+ * Extension API: customize/send/pause/unpause/fired, /notify, Ctrl+Shift+N.
+ *
+ * Templates in PI_NOTIFY_TITLE / PI_NOTIFY_BODY:
+ *   {cwd} {folder} {prompt} {session}
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, InputEvent } from "@earendil-works/pi-coding-agent";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
-function windowsToastScript(title: string, body: string): string {
-    const type = "Windows.UI.Notifications";
-    const mgr = `[${type}.ToastNotificationManager, ${type}, ContentType = WindowsRuntime]`;
-    const template = `[${type}.ToastTemplateType]::ToastText01`;
-    const toast = `[${type}.ToastNotification]::new($xml)`;
-    return [
-        `${mgr} > $null`,
-        `$xml = [${type}.ToastNotificationManager]::GetTemplateContent(${template})`,
-        `$xml.GetElementsByTagName('text')[0].AppendChild($xml.CreateTextNode('${body}')) > $null`,
-        `[${type}.ToastNotificationManager]::CreateToastNotifier('${title}').Show(${toast})`,
-    ].join("; ");
+/** Shape of the object passed to the "pi-notify:customize" event. */
+export interface PiNotifyCustomization {
+	title: string;
+	body: string;
+	/** Template variables available for {placeholder} resolution. Handlers can add new keys. */
+	vars: Record<string, string>;
+}
+
+/** Shape of the object emitted by the "pi-notify:fired" event after a notification is sent. */
+export interface PiNotifyFired {
+	title: string;
+	body: string;
+}
+
+/** Shape of the object passed to the "pi-notify:send" event. All fields are optional. */
+export interface PiNotifySend {
+	title?: string;
+	body?: string;
+	/** Template variables for {placeholder} resolution. Merged with built-in vars. */
+	vars?: Record<string, string>;
+	/** If true, skip the sound hook for this notification. */
+	silent?: boolean;
+}
+
+export type PiNotifyCustomizeHandler = (notification: PiNotifyCustomization) => void | Promise<void>;
+type Unsubscribe = () => void;
+
+interface CustomizeRegistry {
+	handlersByBus: WeakMap<object, Set<PiNotifyCustomizeHandler>>;
+}
+
+const CUSTOMIZE_REGISTRY_KEY = Symbol.for("pi-notify.customize-registry");
+
+function getCustomizeRegistry(): CustomizeRegistry {
+	// 获取跨模块共享的通知定制注册表
+	const scope = globalThis as unknown as { [key: symbol]: CustomizeRegistry | undefined };
+	return (scope[CUSTOMIZE_REGISTRY_KEY] ??= { handlersByBus: new WeakMap() });
+}
+
+function getCustomizeHandlers(events: ExtensionAPI["events"]): Set<PiNotifyCustomizeHandler> {
+	// 获取指定 EventBus 的定制处理器集合
+	const registry = getCustomizeRegistry();
+	const bus = events as object;
+	let handlers = registry.handlersByBus.get(bus);
+	if (!handlers) {
+		handlers = new Set();
+		registry.handlersByBus.set(bus, handlers);
+	}
+	return handlers;
+}
+
+/** Register an awaited notification customizer for a Pi event bus. */
+export function registerCustomize(
+	pi: Pick<ExtensionAPI, "events">,
+	handler: PiNotifyCustomizeHandler,
+): Unsubscribe {
+	// 注册可等待的通知定制处理器
+	const registry = getCustomizeRegistry();
+	const bus = pi.events as object;
+	const handlers = getCustomizeHandlers(pi.events);
+	handlers.add(handler);
+	return () => {
+		handlers.delete(handler);
+		if (handlers.size === 0) registry.handlersByBus.delete(bus);
+	};
+}
+
+export const COOLDOWN_MS = 30_000;
+export const ENGAGEMENT_MS = 15_000;
+
+/** Cap for the {prompt} template var, keeping toast command lines within Windows limits. */
+const PROMPT_VAR_MAX = 500;
+
+export interface NotifyState {
+	/** Most recent idle interactive prompt text, used for notification context. */
+	lastIdlePromptText: string;
+	/** Timestamp (ms) of the most recent mid-stream steer. */
+	lastSteerAt: number;
+	/** Timestamp (ms) of the last notification we actually sent. */
+	lastNotifiedAt: number;
+}
+
+// ── Path / sanitize helpers ───────────────────────────────────────────────────
+
+/** Strip C0/C1 controls that break terminal streams. */
+export function stripControlChars(text: string): string {
+	// 移除通知文本中的 C0/C1 控制字符
+	return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "");
+}
+
+/** OSC payload sanitizer: controls + `;` (OSC field separator) + whitespace collapse. */
+export function sanitizeOscText(text: string): string {
+	// 清理写入 OSC 序列的通知文本
+	return stripControlChars(text).replace(/;/g, ",").replace(/\s+/g, " ").trim();
+}
+
+/** Convert a local icon path to a toast-ready `file://` URI. */
+export function toastImageSrc(localPath: string): string {
+	// 将本地图标路径转换为 Windows toast 可用的 file URI
+	const withSlashes = localPath.replace(/\\/g, "/");
+	if (/^[a-z]+:\/\//i.test(withSlashes)) return withSlashes;
+	if (withSlashes.startsWith("//")) return `file:${withSlashes}`;
+	return `file:///${withSlashes}`;
+}
+
+function extensionDirCandidates(): string[] {
+	// 收集扩展自身所在目录候选（不含 cwd，避免误用项目内同名 logo）
+	const dirs: string[] = [];
+	try {
+		dirs.push(path.dirname(fileURLToPath(import.meta.url)));
+	} catch {
+		// jiti / non-file import.meta — ignore
+	}
+	const cjsDir = (globalThis as { __dirname?: string }).__dirname;
+	if (cjsDir) dirs.push(cjsDir);
+	return [...new Set(dirs)];
+}
+
+function isWSL(): boolean {
+	// 判断当前是否运行在 WSL
+	return Boolean(process.env.WSLENV) || (process.platform === "linux" && Boolean(process.env.WSL_DISTRO_NAME));
+}
+
+export function resolveIconPath(iconRelative: string = "logo.png"): string | undefined {
+	// 解析 Windows toast 图标的本机路径
+	let localPath: string | undefined;
+	for (const dir of extensionDirCandidates()) {
+		const candidate = path.resolve(dir, iconRelative);
+		if (existsSync(candidate)) {
+			localPath = candidate;
+			break;
+		}
+	}
+	if (!localPath) return undefined;
+
+	if (isWSL()) {
+		try {
+			return execFileSync("wslpath", ["-w", localPath], { encoding: "utf8" }).trim();
+		} catch {
+			return localPath;
+		}
+	}
+
+	return localPath;
+}
+
+function escapePowerShellSingleQuoted(value: string): string {
+	// 转义 PowerShell 单引号字符串
+	return value.replace(/'/g, "''");
+}
+
+// ── Notification transport ────────────────────────────────────────────────────
+
+function windowsToastScript(title: string, body: string, iconPath: string = ""): string {
+	// 生成 Windows toast 的 PowerShell 脚本
+	const type = "Windows.UI.Notifications";
+	const mgr = `[${type}.ToastNotificationManager, ${type}, ContentType = WindowsRuntime]`;
+	const templateType = iconPath ? "ToastImageAndText02" : "ToastText02";
+	const template = `[${type}.ToastTemplateType]::${templateType}`;
+	const safeTitle = escapePowerShellSingleQuoted(title);
+	const safeBody = escapePowerShellSingleQuoted(body);
+
+	const script = [
+		`${mgr} | Out-Null`,
+		`$t = [${type}.ToastNotificationManager]::GetTemplateContent(${template})`,
+		`$t1 = $t.SelectSingleNode('//text[1]')`,
+		`$t2 = $t.SelectSingleNode('//text[2]')`,
+		`$t1.AppendChild($t.CreateTextNode('${safeTitle}')) | Out-Null`,
+		`$t2.AppendChild($t.CreateTextNode('${safeBody}')) | Out-Null`,
+	];
+
+	if (iconPath) {
+		const safeIconPath = escapePowerShellSingleQuoted(toastImageSrc(iconPath));
+		script.push(`$i = $t.SelectSingleNode('//image')`);
+		script.push(`$i.SetAttribute('src', '${safeIconPath}') | Out-Null`);
+	}
+
+	script.push(
+		`[${type}.ToastNotificationManager]::CreateToastNotifier('Pi Agent').Show([${type}.ToastNotification]::new($t))`,
+	);
+
+	return script.join("; ");
 }
 
 function wrapForTmux(sequence: string): string {
-    if (!process.env.TMUX) return sequence;
-
-    // tmux passthrough: wrap in DCS and escape inner ESC bytes.
-    const escaped = sequence.split("\x1b").join("\x1b\x1b");
-    return `\x1bPtmux;${escaped}\x1b\\`;
+	// 在 tmux 下包装 OSC 透传序列
+	if (!process.env.TMUX) return sequence;
+	const escaped = sequence.split("\x1b").join("\x1b\x1b");
+	return `\x1bPtmux;${escaped}\x1b\\`;
 }
 
 function notifyOSC777(title: string, body: string): void {
-    const sequence = `\x1b]777;notify;${title};${body}\x07`;
-    process.stdout.write(wrapForTmux(sequence));
+	// 通过 OSC 777 发送通知
+	const sequence = `\x1b]777;notify;${title};${body}\x07`;
+	process.stdout.write(wrapForTmux(sequence));
 }
 
 function notifyOSC9(message: string): void {
-    const sequence = `\x1b]9;${message}\x07`;
-    process.stdout.write(wrapForTmux(sequence));
+	// 通过 OSC 9 发送通知
+	const sequence = `\x1b]9;${message}\x07`;
+	process.stdout.write(wrapForTmux(sequence));
 }
 
 function notifyOSC99(title: string, body: string): void {
-    // Kitty OSC 99: i=notification id, d=0 means not done yet, p=body for second part
-    const titleSequence = `\x1b]99;i=1:d=0;${title}\x1b\\`;
-    const bodySequence = `\x1b]99;i=1:p=body;${body}\x1b\\`;
-    process.stdout.write(wrapForTmux(titleSequence));
-    process.stdout.write(wrapForTmux(bodySequence));
+	// 通过 OSC 99 发送 Kitty 通知
+	const titleSequence = `\x1b]99;i=1:d=0;${title}\x1b\\`;
+	const bodySequence = `\x1b]99;i=1:p=body;${body}\x1b\\`;
+	process.stdout.write(wrapForTmux(titleSequence));
+	process.stdout.write(wrapForTmux(bodySequence));
 }
 
-function notifyWindows(title: string, body: string): void {
-    const { execFile } = require("node:child_process");
-    execFile("powershell.exe", ["-NoProfile", "-Command", windowsToastScript(title, body)]);
+function notifyWindows(title: string, body: string, iconPath?: string): void {
+	// 通过 PowerShell toast 发送 Windows 通知
+	const args = ["-NoProfile", "-Command", windowsToastScript(title, body, iconPath ?? "")];
+
+	// WSL interop needs the .exe suffix; plain Windows resolves either way.
+	const pwshBinary = process.platform === "win32" || isWSL() ? "pwsh.exe" : "pwsh";
+
+	// Try pwsh first; fall back to Windows PowerShell. Only surface a single
+	// error when both fail, so a broken toast doesn't spam the session log.
+	execFile(pwshBinary, args, (pwshErr) => {
+		if (!pwshErr) return;
+		execFile("powershell.exe", args, (psErr) => {
+			if (psErr) console.error("pi-notify windows toast failed (pwsh + powershell.exe):", psErr);
+		});
+	});
 }
 
 function runSoundHook(): void {
-    const command = process.env.PI_NOTIFY_SOUND_CMD?.trim();
-    if (!command) return;
+	// 运行可选的自定义声音钩子
+	const command = process.env.PI_NOTIFY_SOUND_CMD?.trim();
+	if (!command) return;
 
-    try {
-        const { spawn } = require("node:child_process");
-        const child = spawn(command, {
-            shell: true,
-            detached: true,
-            stdio: "ignore",
-        });
-        child.unref();
-    } catch {
-        // Ignore hook errors to avoid breaking notifications
-    }
+	try {
+		const child = spawn(command, {
+			shell: true,
+			detached: true,
+			stdio: "ignore",
+		});
+		child.unref();
+	} catch {
+		// Ignore hook errors to avoid breaking notifications
+	}
 }
 
-function notify(title: string, body: string): void {
-    const isIterm2 = process.env.TERM_PROGRAM === "iTerm.app" || Boolean(process.env.ITERM_SESSION_ID);
+function sendNotification(title: string, body: string, iconPath?: string): void {
+	// 按终端环境选择通知投递通道
+	const isIterm2 = process.env.TERM_PROGRAM === "iTerm.app" || Boolean(process.env.ITERM_SESSION_ID);
 
-    if (process.env.WT_SESSION) {
-        notifyWindows(title, body);
-    } else if (process.env.KITTY_WINDOW_ID) {
-        notifyOSC99(title, body);
-    } else if (isIterm2) {
-        notifyOSC9(`${title}: ${body}`);
-    } else {
-        notifyOSC777(title, body);
-    }
+	if (process.env.WT_SESSION) {
+		// Toast text is PowerShell-escaped; only strip controls, keep ';' in prose.
+		const winTitle = stripControlChars(title).replace(/\s+/g, " ").trim() || "Pi";
+		const winBody = stripControlChars(body).replace(/\s+/g, " ").trim() || "Ready for input";
+		notifyWindows(winTitle, winBody, iconPath);
+		return;
+	}
 
-    runSoundHook();
+	const oscTitle = sanitizeOscText(title) || "Pi";
+	const oscBody = sanitizeOscText(body) || "Ready for input";
+
+	if (process.env.KITTY_WINDOW_ID) {
+		notifyOSC99(oscTitle, oscBody);
+	} else if (isIterm2) {
+		notifyOSC9(`${oscTitle}: ${oscBody}`);
+	} else {
+		notifyOSC777(oscTitle, oscBody);
+	}
 }
+
+/** Replace {key} placeholders with values from vars. Unknown placeholders are left as-is. */
+export function resolveTemplates(text: string, vars: Record<string, string>): string {
+	// 解析通知文本中的模板占位符
+	return text.replace(/\{(\w+)\}/g, (match, key: string) => vars[key] ?? match);
+}
+
+// ── Streaming-aware suppression ───────────────────────────────────────────────
+
+export function createState(): NotifyState {
+	// 创建通知抑制状态
+	return {
+		lastIdlePromptText: "",
+		lastSteerAt: 0,
+		lastNotifiedAt: 0,
+	};
+}
+
+/** Update engagement state from an input event. Only interactive input counts. */
+export function recordInput(state: NotifyState, event: InputEvent, now: number): void {
+	// 根据输入事件更新参与度状态
+	if (event.source !== "interactive") return;
+	if (event.streamingBehavior === "steer") {
+		state.lastSteerAt = now;
+	} else if (event.streamingBehavior === undefined) {
+		state.lastIdlePromptText = event.text;
+	}
+}
+
+/**
+ * Decide whether to notify when the agent has settled. Cheap checks run first;
+ * isFocused() (which may shell out) is only invoked if nothing else suppresses.
+ */
+export function shouldNotify(state: NotifyState, now: number, isFocused: () => boolean): boolean {
+	// 判断 agent_settled 是否应发送通知
+	if (now - state.lastSteerAt < ENGAGEMENT_MS) return false;
+	if (now - state.lastNotifiedAt < COOLDOWN_MS) return false;
+	if (isFocused()) return false;
+	return true;
+}
+
+/** Build the default notification body from the most recent idle prompt. */
+export function buildBody(promptText: string): string {
+	// 根据最近空闲提示构建默认通知正文
+	const cleaned = promptText.trim().replace(/\s+/g, " ");
+	if (!cleaned) return "Task complete. Ready for input.";
+	const snippet = cleaned.length > 60 ? cleaned.slice(0, 60) + "…" : cleaned;
+	return `Done: "${snippet}"`;
+}
+
+/** Build the default notification title, including session name when available. */
+export function buildTitle(sessionName: string | undefined, folder?: string): string {
+	// 根据会话名与项目目录构建默认通知标题
+	if (sessionName) return `Pi — ${sessionName}`;
+	if (folder) return `Pi (${folder})`;
+	return "Pi Agent";
+}
+
+/**
+ * Returns true if the terminal is currently focused.
+ * Runs PI_NOTIFY_FOCUS_CMD as a shell command; exit 0 means focused (suppress).
+ * If the env var is unset, always returns false (never suppress based on focus).
+ */
+function isFocused(): boolean {
+	// 通过可选焦点命令检测终端是否前台
+	const cmd = process.env.PI_NOTIFY_FOCUS_CMD?.trim();
+	if (!cmd) return false;
+	try {
+		if (process.platform === "win32") {
+			execFileSync("cmd.exe", ["/d", "/s", "/c", cmd], { timeout: 3000, stdio: "ignore" });
+		} else {
+			execFileSync("sh", ["-c", cmd], { timeout: 3000, stdio: "ignore" });
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function builtInVars(options: {
+	cwd: string;
+	sessionName?: string;
+	promptText?: string;
+	extra?: Record<string, string>;
+}): Record<string, string> {
+	// 组装内置模板变量
+	const folder = path.basename(options.cwd);
+	return {
+		cwd: options.cwd,
+		folder,
+		prompt: (options.promptText ?? "").slice(0, PROMPT_VAR_MAX),
+		session: options.sessionName ?? "",
+		...options.extra,
+	};
+}
+
+export async function runHandlers<T>(
+	handlers: Array<(payload: T) => void | Promise<void>>,
+	payload: T,
+): Promise<void> {
+	// 依次执行事件处理器；单个失败不影响其余
+	for (const handler of handlers) {
+		try {
+			await handler(payload);
+		} catch (err) {
+			console.error("pi-notify handler error:", err);
+		}
+	}
+}
+
+/** Apply legacy synchronous bus hooks and awaited registered customizers. */
+export async function applyCustomizations(
+	events: ExtensionAPI["events"],
+	notification: PiNotifyCustomization,
+): Promise<void> {
+	// 应用兼容事件钩子与显式注册的异步定制器
+	events.emit("pi-notify:customize", notification);
+	await runHandlers([...getCustomizeHandlers(events)], notification);
+}
+
+// ── Extension entry point ─────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-    pi.on("agent_end", async () => {
-        notify("Pi", "Ready for input");
-    });
+	// 注册 pi-notify 生命周期钩子与扩展 API
+	let state = createState();
+	let paused = false;
+	let sending = false;
+	let latestCwd = process.cwd();
+	let statusUi: ExtensionContext["ui"] | undefined;
+	let disposed = false;
+	const unsubscribers: Unsubscribe[] = [];
+
+	function updateStatus(ui: ExtensionContext["ui"] | undefined = statusUi): void {
+		// 更新底部通知开关状态
+		if (!ui) return;
+		statusUi = ui;
+		ui.setStatus("pi-notify", paused ? "🔕 notify: off" : "🔔 notify: on");
+	}
+
+	function setPaused(nextPaused: boolean): void {
+		// 更新暂停状态、footer，并广播事件
+		if (disposed || paused === nextPaused) return;
+		paused = nextPaused;
+		updateStatus();
+		pi.events.emit("pi-notify:paused", { paused });
+	}
+
+	async function notify(
+		rawTitle: string,
+		rawBody: string,
+		baseVars: Record<string, string>,
+		options?: { silent?: boolean },
+	): Promise<boolean> {
+		// 发送经过模板解析与扩展钩子处理后的通知
+		// Re-entrancy guard: a customize/fired handler that emits pi-notify:send
+		// must not recurse into another send while this one is in flight.
+		if (disposed || paused || sending) return false;
+		sending = true;
+		try {
+			const notification: PiNotifyCustomization = {
+				title: rawTitle,
+				body: rawBody,
+				vars: { ...baseVars },
+			};
+
+			// Legacy bus handlers stay synchronous; explicit customizers are awaited.
+			await applyCustomizations(pi.events, notification);
+			if (disposed || paused) return false;
+
+			const title = resolveTemplates(notification.title, notification.vars);
+			const body = resolveTemplates(notification.body, notification.vars);
+
+			// Resolve per send so late-added logos (or WSL state changes) take effect without a reload.
+			sendNotification(title, body, resolveIconPath("logo.png"));
+
+			if (!options?.silent) {
+				runSoundHook();
+			}
+
+			pi.events.emit("pi-notify:fired", { title, body } satisfies PiNotifyFired);
+			return true;
+		} finally {
+			sending = false;
+		}
+	}
+
+	async function handleSend(msg: PiNotifySend): Promise<void> {
+		// 处理扩展触发的主动通知
+		if (disposed) return;
+
+		const sessionName = pi.getSessionName();
+		const cwd = latestCwd || process.cwd();
+		const folder = path.basename(cwd);
+		const vars = builtInVars({
+			cwd,
+			sessionName,
+			promptText: state.lastIdlePromptText,
+			extra: msg.vars,
+		});
+
+		const sent = await notify(
+			msg.title ?? process.env.PI_NOTIFY_TITLE ?? buildTitle(sessionName, folder),
+			msg.body ?? "Notification",
+			vars,
+			{ silent: msg.silent },
+		);
+		if (sent) {
+			state.lastNotifiedAt = Date.now();
+		}
+	}
+
+	function toggleNotifications(ctx: ExtensionContext): void {
+		// 切换通知开关并反馈 UI
+		statusUi = ctx.ui;
+		setPaused(!paused);
+		ctx.ui.notify(paused ? "Notifications paused 🔕" : "Notifications enabled 🔔", "info");
+	}
+
+	function track(off: Unsubscribe): void {
+		// 记录可在 shutdown 时注销的订阅
+		unsubscribers.push(off);
+	}
+
+	// Control-plane channels stay on the real shared bus (no emit patch).
+	track(
+		pi.events.on("pi-notify:pause", () => {
+			setPaused(true);
+		}),
+	);
+	track(
+		pi.events.on("pi-notify:unpause", () => {
+			setPaused(false);
+		}),
+	);
+	track(
+		pi.events.on("pi-notify:send", (data) => {
+			void handleSend(data as PiNotifySend).catch((err) => {
+				console.error("pi-notify:send failed:", err);
+			});
+		}),
+	);
+
+	pi.registerCommand("notify", {
+		description: "Toggle desktop notifications on/off",
+		handler: async (_args, ctx) => {
+			toggleNotifications(ctx);
+		},
+	});
+
+	pi.registerShortcut("ctrl+shift+n", {
+		description: "Toggle desktop notifications on/off",
+		handler: async (ctx) => {
+			toggleNotifications(ctx);
+		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		latestCwd = ctx.cwd;
+		// Fresh session: drop prompt/steer/cooldown state from the previous session.
+		state = createState();
+		updateStatus(ctx.ui);
+	});
+
+	pi.on("session_shutdown", async () => {
+		// 注销 bus 订阅，防止 reload/switch 泄漏
+		if (disposed) return;
+		disposed = true;
+		for (const off of unsubscribers.splice(0)) {
+			try {
+				off();
+			} catch {
+				// Ignore unsubscribe errors during teardown
+			}
+		}
+		statusUi = undefined;
+	});
+
+	pi.on("input", async (event) => {
+		recordInput(state, event, Date.now());
+		return { action: "continue" as const };
+	});
+
+	// agent_settled = no retry / compaction / queued follow-up left (true idle).
+	pi.on("agent_settled", async (_event, ctx) => {
+		latestCwd = ctx.cwd;
+
+		const now = Date.now();
+		if (!shouldNotify(state, now, isFocused)) return;
+
+		const sessionName = pi.getSessionName();
+		const cwd = ctx.cwd;
+		const folder = path.basename(cwd);
+		const vars = builtInVars({
+			cwd,
+			sessionName,
+			promptText: state.lastIdlePromptText,
+		});
+
+		const sent = await notify(
+			process.env.PI_NOTIFY_TITLE ?? buildTitle(sessionName, folder),
+			process.env.PI_NOTIFY_BODY ?? buildBody(state.lastIdlePromptText),
+			vars,
+		);
+		if (sent) {
+			state.lastNotifiedAt = Date.now();
+		}
+	});
 }

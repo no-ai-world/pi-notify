@@ -1,6 +1,6 @@
 {
     "name": "pi-notify",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "description": "Desktop notifications for Pi agent via OSC 777/99/9 and Windows toast",
     "keywords": [
         "pi-package",
@@ -13,11 +13,25 @@
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/ferologics/pi-notify.git"
+        "url": "git+https://github.com/no-ai-world/pi-notify.git"
     },
-    "homepage": "https://github.com/ferologics/pi-notify#readme",
+    "homepage": "https://github.com/no-ai-world/pi-notify#readme",
     "bugs": {
-        "url": "https://github.com/ferologics/pi-notify/issues"
+        "url": "https://github.com/no-ai-world/pi-notify/issues"
+    },
+    "main": "./index.ts",
+    "types": "./index.ts",
+    "scripts": {
+        "test": "bun test"
+    },
+    "files": [
+        "index.ts",
+        "logo.png",
+        "README.md",
+        "LICENSE"
+    ],
+    "devDependencies": {
+        "bun-types": "latest"
     },
     "pi": {
         "extensions": [
@@ -28,7 +42,7 @@
         "@earendil-works/pi-coding-agent": "*"
     },
     "piRelease": {
-        "repo": "ferologics/pi-notify",
+        "repo": "no-ai-world/pi-notify",
         "branch": "master",
         "subtreePublishRecipe": "publish-pi-notify"
     }
