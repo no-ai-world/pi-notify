@@ -21,6 +21,7 @@ Expected: all tests pass.
 | `index.ts` | The extension — delivery functions (OSC/Windows) + pure suppression logic + extension APIs |
 | `index.test.ts` | Unit tests for pure exported functions |
 | `logo.png` | Windows toast icon |
+| `e2e.test.ts` | Real-pi e2e tests in bun test form: in-process mock LLM server + isolated config dir; 8 scenarios (settle content, cooldown, focus suppress/pass, env template vars, OSC sanitizing, sound hook, Windows toast [on by default on win32, `PI_NOTIFY_E2E_NO_TOAST=1` opts out]); skips when pi is not on PATH |
 | `package.json` | `bun test` script + peer dependency on `@earendil-works/pi-coding-agent` |
 
 ## Architecture rules
