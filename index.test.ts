@@ -8,6 +8,10 @@ import registerExtension, {
 	shouldNotify,
 	buildBody,
 	buildTitle,
+	buildPermissionTitle,
+	buildPermissionBody,
+	permissionVars,
+	isPermissionUiPrompt,
 	resolveTemplates,
 	sanitizeOscText,
 	stripControlChars,
@@ -17,6 +21,7 @@ import registerExtension, {
 	registerCustomize,
 	ENGAGEMENT_MS,
 	COOLDOWN_MS,
+	type PermissionUiPromptEvent,
 } from "./index.ts";
 
 // Minimal InputEvent stub — avoids importing from @earendil-works/pi-coding-agent at test time
@@ -26,6 +31,136 @@ function inputEvent(partial: Partial<InputEvent>): InputEvent {
 	// 构造最小化的输入事件桩
 	return { source: "interactive", text: "", ...partial };
 }
+
+// --- permission prompts ---
+
+function permissionPrompt(over: Partial<PermissionUiPromptEvent> = {}): PermissionUiPromptEvent {
+	// 构造最小化的权限提示事件桩
+	return {
+		requestId: "req-1",
+		source: "tool_call",
+		surface: "bash",
+		value: "git status",
+		agentName: null,
+		message: "",
+		forwarding: null,
+		...over,
+	};
+}
+
+// --- buildPermissionTitle ---
+
+test("buildPermissionTitle: no who/session falls back to the generic ask", () => {
+	expect(buildPermissionTitle(permissionPrompt())).toBe("Pi needs approval");
+});
+
+test("buildPermissionTitle: agentName is shown in the title", () => {
+	expect(buildPermissionTitle(permissionPrompt({ agentName: "Coder" }))).toBe("Pi needs approval (Coder)");
+});
+
+test("buildPermissionTitle: forwarded requester wins over agentName", () => {
+	expect(
+		buildPermissionTitle(
+			permissionPrompt({ agentName: "Coder", forwarding: { requesterAgentName: "Explore", requesterSessionId: "s-1" } }),
+		),
+	).toBe("Pi needs approval (Explore)");
+});
+
+test("buildPermissionTitle: session name is appended when present", () => {
+	expect(buildPermissionTitle(permissionPrompt({ agentName: "Coder" }), "my-project")).toBe(
+		"Pi needs approval (Coder) — my-project",
+	);
+});
+
+// --- buildPermissionBody ---
+
+test("buildPermissionBody: uses the dialog message when present", () => {
+	expect(buildPermissionBody(permissionPrompt({ message: "Run this command?" }))).toBe("Run this command?");
+});
+
+test("buildPermissionBody: falls back to surface + value", () => {
+	expect(buildPermissionBody(permissionPrompt())).toBe("bash: git status");
+});
+
+test("buildPermissionBody: generic fallback when nothing is known", () => {
+	expect(buildPermissionBody(permissionPrompt({ message: "", surface: null, value: null }))).toBe(
+		"A permission decision is required.",
+	);
+});
+
+test("buildPermissionBody: long messages are truncated to 160 chars", () => {
+	expect(buildPermissionBody(permissionPrompt({ message: "x".repeat(200) }))).toBe("x".repeat(159) + "…");
+});
+
+// --- permissionVars ---
+
+test("permissionVars: maps every known field", () => {
+	expect(
+		permissionVars(
+			permissionPrompt({
+				message: "Run it?",
+				agentName: "Coder",
+				forwarding: { requesterAgentName: "Explore", requesterSessionId: "s-1" },
+			}),
+		),
+	).toEqual({
+		permission_surface: "bash",
+		permission_value: "git status",
+		permission_message: "Run it?",
+		permission_agent: "Coder",
+		permission_requester: "Explore",
+	});
+});
+
+test("permissionVars: missing fields become empty strings", () => {
+	expect(permissionVars(permissionPrompt())).toEqual({
+		permission_surface: "bash",
+		permission_value: "git status",
+		permission_message: "",
+		permission_agent: "",
+		permission_requester: "",
+	});
+});
+
+test("permissionVars: value and message are capped at 500 chars", () => {
+	const vars = permissionVars(
+		permissionPrompt({ value: "v".repeat(800), message: "m".repeat(800) }),
+	);
+	expect(vars.permission_value).toBe("v".repeat(500));
+	expect(vars.permission_message).toBe("m".repeat(500));
+});
+
+// --- isPermissionUiPrompt ---
+
+test("isPermissionUiPrompt: accepts a well-formed prompt payload", () => {
+	expect(isPermissionUiPrompt(permissionPrompt())).toBe(true);
+});
+
+test("isPermissionUiPrompt: rejects non-objects and empty objects", () => {
+	expect(isPermissionUiPrompt(null)).toBe(false);
+	expect(isPermissionUiPrompt("notify")).toBe(false);
+	expect(isPermissionUiPrompt(42)).toBe(false);
+	expect(isPermissionUiPrompt({})).toBe(false);
+});
+
+test("permission builders: non-string fields degrade instead of throwing", () => {
+	// Cross-extension payloads are untyped at runtime; a field that violates
+	// the contract must not crash the notification pipeline.
+	const malformed = {
+		requestId: 123,
+		message: 456,
+		surface: "bash",
+		value: null,
+		agentName: null,
+		forwarding: "nope",
+	} as unknown as PermissionUiPromptEvent;
+	expect(() => buildPermissionBody(malformed)).not.toThrow();
+	expect(() => buildPermissionTitle(malformed)).not.toThrow();
+	expect(() => permissionVars(malformed)).not.toThrow();
+	expect(buildPermissionBody(malformed)).toBe("A permission decision is required.");
+	expect(permissionVars(malformed).permission_value).toBe("");
+	expect(permissionVars(malformed).permission_message).toBe("");
+});
 
 // --- buildBody ---
 
@@ -193,6 +328,8 @@ async function withIsolatedTransport(fn: (writes: unknown[][]) => Promise<void>)
 		"ITERM_SESSION_ID",
 		"PI_NOTIFY_SOUND_CMD",
 		"PI_NOTIFY_FOCUS_CMD",
+		"PI_NOTIFY_PERMISSION_TITLE",
+		"PI_NOTIFY_PERMISSION_BODY",
 	] as const;
 	const savedEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
 	for (const k of envKeys) delete process.env[k];
@@ -347,9 +484,95 @@ test("extension lifecycle: leaves EventBus methods intact and unsubscribes contr
 
 	expect(bus.events.on).toBe(originalOn);
 	expect(bus.count("pi-notify:send")).toBe(1);
+	expect(bus.count("permissions:ui_prompt")).toBe(1);
 	await lifecycle.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" });
 	expect(bus.events.on).toBe(originalOn);
 	expect(bus.count("pi-notify:send")).toBe(0);
+	expect(bus.count("permissions:ui_prompt")).toBe(0);
+});
+
+test("extension: permissions:ui_prompt sends a notification with ask content", async () => {
+	const bus = createTestBus();
+	const { pi } = createTestPi(bus);
+	registerExtension(pi);
+
+	const fired: Array<{ title: string; body: string }> = [];
+	bus.events.on("pi-notify:fired", (n) => fired.push(n as { title: string; body: string }));
+
+	await withIsolatedTransport(async (writes) => {
+		bus.events.emit("permissions:ui_prompt", permissionPrompt({ message: "Run it?" }));
+		await new Promise((r) => setTimeout(r, 0));
+		expect(writes).toHaveLength(1);
+		expect(fired).toHaveLength(1);
+		expect(fired[0].title).toBe("Pi needs approval");
+		expect(fired[0].body).toBe("Run it?");
+	});
+});
+
+test("extension: permission notify starts the cooldown for a following settle", async () => {
+	const bus = createTestBus();
+	const { pi, lifecycle } = createTestPi(bus);
+	registerExtension(pi);
+
+	await withIsolatedTransport(async (writes) => {
+		bus.events.emit("permissions:ui_prompt", permissionPrompt({ message: "Approve?" }));
+		await new Promise((r) => setTimeout(r, 0));
+		expect(writes).toHaveLength(1);
+
+		await lifecycle.get("agent_settled")?.({ type: "agent_settled" } as any, { cwd: process.cwd() });
+		await new Promise((r) => setTimeout(r, 0));
+		expect(writes).toHaveLength(1);
+	});
+});
+
+test("extension: paused suppresses permission notifications", async () => {
+	const bus = createTestBus();
+	const { pi } = createTestPi(bus);
+	registerExtension(pi);
+
+	await withIsolatedTransport(async (writes) => {
+		bus.events.emit("pi-notify:pause");
+		bus.events.emit("permissions:ui_prompt", permissionPrompt({ message: "Approve?" }));
+		await new Promise((r) => setTimeout(r, 0));
+		expect(writes).toHaveLength(0);
+
+		bus.events.emit("pi-notify:unpause");
+		bus.events.emit("permissions:ui_prompt", permissionPrompt({ message: "Approve?" }));
+		await new Promise((r) => setTimeout(r, 0));
+		expect(writes).toHaveLength(1);
+	});
+});
+
+test("extension: PI_NOTIFY_PERMISSION_TITLE/BODY resolve permission vars", async () => {
+	const bus = createTestBus();
+	const { pi } = createTestPi(bus);
+	registerExtension(pi);
+
+	const savedTitle = process.env.PI_NOTIFY_PERMISSION_TITLE;
+	const savedBody = process.env.PI_NOTIFY_PERMISSION_BODY;
+	process.env.PI_NOTIFY_PERMISSION_TITLE = "Perm {permission_surface} — {folder}";
+	process.env.PI_NOTIFY_PERMISSION_BODY = "{permission_value} by {permission_agent}|{permission_requester}";
+
+	try {
+		await withIsolatedTransport(async (writes) => {
+			process.env.PI_NOTIFY_PERMISSION_TITLE = "Perm {permission_surface} — {folder}";
+			process.env.PI_NOTIFY_PERMISSION_BODY = "{permission_value} by {permission_agent}|{permission_requester}";
+			bus.events.emit(
+				"permissions:ui_prompt",
+				permissionPrompt({ agentName: "Coder", forwarding: { requesterAgentName: "Explore", requesterSessionId: "s" } }),
+			);
+			await new Promise((r) => setTimeout(r, 0));
+			expect(writes).toHaveLength(1);
+			const fired = writes[0][0] as string;
+			expect(fired).toContain("Perm bash — ");
+			expect(fired).toContain("git status by Coder|Explore");
+		});
+	} finally {
+		if (savedTitle === undefined) delete process.env.PI_NOTIFY_PERMISSION_TITLE;
+		else process.env.PI_NOTIFY_PERMISSION_TITLE = savedTitle;
+		if (savedBody === undefined) delete process.env.PI_NOTIFY_PERMISSION_BODY;
+		else process.env.PI_NOTIFY_PERMISSION_BODY = savedBody;
+	}
 });
 
 // --- recordInput ---

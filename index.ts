@@ -89,6 +89,33 @@ export const ENGAGEMENT_MS = 15_000;
 /** Cap for the {prompt} template var, keeping toast command lines within Windows limits. */
 const PROMPT_VAR_MAX = 500;
 
+/** Cap for permission notification body text, keeping toasts compact. */
+const PERMISSION_BODY_MAX = 160;
+
+/**
+ * Shape of the `permissions:ui_prompt` event broadcast by
+ * `@gotgenes/pi-permission-system` right before it shows its ask dialog.
+ *
+ * Local structural copy: that package is an optional runtime dependency, so
+ * pi-notify never imports from it. Fields are read defensively instead.
+ */
+export interface PermissionUiPromptEvent {
+	/** Unique ID for the permission request being prompted. */
+	requestId: string;
+	/** Prompt origin: tool call, or skill input/read. */
+	source: "tool_call" | "skill_input" | "skill_read";
+	/** Normalized display surface (e.g. "bash", "skill", tool name). */
+	surface: string | null;
+	/** Normalized display value (command, path, skill name, …). */
+	value: string | null;
+	/** Agent that requested the permission, when known. */
+	agentName: string | null;
+	/** Message shown in the permission dialog. */
+	message: string;
+	/** Forwarding context for a subagent ask; null for a direct prompt. */
+	forwarding: { requesterAgentName: string | null; requesterSessionId: string | null } | null;
+}
+
 export interface NotifyState {
 	/** Most recent idle interactive prompt text, used for notification context. */
 	lastIdlePromptText: string;
@@ -342,6 +369,60 @@ export function buildTitle(sessionName: string | undefined, folder?: string): st
 	return "Pi Agent";
 }
 
+/** True when the payload looks like a `permissions:ui_prompt` broadcast. */
+export function isPermissionUiPrompt(data: unknown): data is PermissionUiPromptEvent {
+	// 防御性识别权限提示广播载荷
+	if (typeof data !== "object" || data === null) return false;
+	const event = data as Partial<PermissionUiPromptEvent>;
+	return (
+		typeof event.requestId === "string" ||
+		typeof event.message === "string" ||
+		typeof event.surface === "string" ||
+		typeof event.value === "string"
+	);
+}
+
+function truncateText(text: string, max: number): string {
+	// 截断长文本并保留省略号
+	if (text.length <= max) return text;
+	return text.slice(0, max - 1) + "…";
+}
+
+/** Build the default notification title for a permission prompt. */
+export function buildPermissionTitle(event: PermissionUiPromptEvent, sessionName?: string): string {
+	// 根据权限提示构建默认通知标题
+	const who = event.forwarding?.requesterAgentName ?? event.agentName;
+	const base = who ? `Pi needs approval (${who})` : "Pi needs approval";
+	return sessionName ? `${base} — ${sessionName}` : base;
+}
+
+/** Build the default notification body for a permission prompt. */
+export function buildPermissionBody(event: PermissionUiPromptEvent): string {
+	// 根据权限提示构建默认通知正文（跨扩展载荷，字段防御性读取）
+	const message = typeof event.message === "string" ? event.message.trim() : "";
+	if (message) return truncateText(message, PERMISSION_BODY_MAX);
+	const surface = typeof event.surface === "string" ? event.surface : "permission";
+	const value = typeof event.value === "string" ? event.value.trim() : "";
+	if (value) {
+		const budget = Math.max(1, PERMISSION_BODY_MAX - surface.length - 2);
+		return `${surface}: ${truncateText(value, budget)}`;
+	}
+	return "A permission decision is required.";
+}
+
+/** Template variables exposed for permission notifications. */
+export function permissionVars(event: PermissionUiPromptEvent): Record<string, string> {
+	// 组装权限提示可用的模板变量（跨扩展载荷，字段防御性读取）
+	return {
+		permission_surface: typeof event.surface === "string" ? event.surface : "",
+		permission_value: (typeof event.value === "string" ? event.value : "").slice(0, PROMPT_VAR_MAX),
+		permission_message: (typeof event.message === "string" ? event.message : "").slice(0, PROMPT_VAR_MAX),
+		permission_agent: typeof event.agentName === "string" ? event.agentName : "",
+		permission_requester:
+			typeof event.forwarding?.requesterAgentName === "string" ? event.forwarding.requesterAgentName : "",
+	};
+}
+
 /**
  * Returns true if the terminal is currently focused.
  * Runs PI_NOTIFY_FOCUS_CMD as a shell command; exit 0 means focused (suppress).
@@ -495,6 +576,32 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	async function handlePermissionPrompt(data: unknown): Promise<void> {
+		// 处理权限系统广播的待确认提示
+		if (disposed || paused) return;
+		if (!isPermissionUiPrompt(data)) return;
+		if (isFocused()) return; // the ask dialog is already visible to the user
+
+		const sessionName = pi.getSessionName();
+		const cwd = latestCwd || process.cwd();
+		const folder = path.basename(cwd);
+		const vars = {
+			...builtInVars({ cwd, sessionName, promptText: state.lastIdlePromptText }),
+			...permissionVars(data),
+		};
+
+		const sent = await notify(
+			process.env.PI_NOTIFY_PERMISSION_TITLE ?? buildPermissionTitle(data, sessionName),
+			process.env.PI_NOTIFY_PERMISSION_BODY ?? buildPermissionBody(data),
+			vars,
+		);
+		if (sent) {
+			// Start the cooldown so the settle after the user approves does not
+			// double-notify; each ask itself bypasses the cooldown gate.
+			state.lastNotifiedAt = Date.now();
+		}
+	}
+
 	function toggleNotifications(ctx: ExtensionContext): void {
 		// 切换通知开关并反馈 UI
 		statusUi = ctx.ui;
@@ -522,6 +629,18 @@ export default function (pi: ExtensionAPI) {
 		pi.events.on("pi-notify:send", (data) => {
 			void handleSend(data as PiNotifySend).catch((err) => {
 				console.error("pi-notify:send failed:", err);
+			});
+		}),
+	);
+
+	// @gotgenes/pi-permission-system broadcasts `permissions:ui_prompt` right
+	// before showing its ask dialog; ping the user that the agent is waiting
+	// on a decision. No hard dependency: without that package installed, no
+	// events fire and this listener stays inert.
+	track(
+		pi.events.on("permissions:ui_prompt", (data) => {
+			void handlePermissionPrompt(data).catch((err) => {
+				console.error("pi-notify permissions:ui_prompt failed:", err);
 			});
 		}),
 	);

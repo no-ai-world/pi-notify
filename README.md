@@ -48,12 +48,16 @@ When Pi fully settles (`agent_settled` — no retry, compaction, or queued follo
 
 Clicking the notification focuses the terminal window/tab.
 
+When the optional `@gotgenes/pi-permission-system` extension is installed, pi-notify also pings you when the agent is waiting on a permission decision (see [Permission reminders](#permission-reminders-pi-permission-system)).
+
 ## Notification content
 
 Default content (overridable via env vars / extension hooks):
 
 - **Title:** `Pi — <session name>` when a Pi session name is set, otherwise `Pi (<folder>)`, otherwise `Pi Agent`
 - **Body:** `Done: "your last prompt"` (truncated to 60 characters), or `Task complete. Ready for input.` if no prompt text is available
+
+Permission reminders use their own defaults — see [Permission reminders](#permission-reminders-pi-permission-system).
 
 ## Smart suppression
 
@@ -65,6 +69,33 @@ The extension suppresses notifications to avoid noise. Checks run cheapest-first
 | Cooldown | 30 seconds | Deduplicates rapid back-to-back completions |
 | Focus detection | `PI_NOTIFY_FOCUS_CMD` exit 0 | Terminal is frontmost — user is already watching |
 | Manual pause | `/notify` or `Ctrl+Shift+N` | User disabled notifications |
+
+Permission reminders have different rules — they ignore the steer/cooldown gates but still respect focus and pause (see below).
+
+## Permission reminders (pi-permission-system)
+
+When the optional [`@gotgenes/pi-permission-system`](https://github.com/gotgenes/pi-packages/tree/main/packages/pi-permission-system) extension is installed, pi-notify listens on its `permissions:ui_prompt` broadcast and pings you whenever the agent is waiting on a permission decision — so an `ask` dialog in an unfocused terminal never stalls silently.
+
+```bash
+pi install npm:@gotgenes/pi-permission-system
+```
+
+Default content:
+
+- **Title:** `Pi needs approval`, plus the requesting agent when known (`Pi needs approval (Explore)`) and the session name (`Pi needs approval — my-project`)
+- **Body:** the dialog message (truncated to 160 characters), falling back to `bash: git status` (surface + value), then to `A permission decision is required.`
+
+Suppression semantics differ from `agent_settled` notifications:
+
+| Signal | Behavior |
+| --- | --- |
+| Recent steer / cooldown | **Ignored** — each ask is a distinct decision the agent is blocked on |
+| Focus detection | Suppressed when the terminal is frontmost — the dialog is already visible |
+| Manual pause | Suppressed — the mute switch applies to everything |
+
+A permission notification still starts the 30s cooldown, so the `agent_settled` notification right after you approve is deduped.
+
+Customize via `PI_NOTIFY_PERMISSION_TITLE` / `PI_NOTIFY_PERMISSION_BODY` and the `{permission_*}` template variables, or through the same `pi-notify:customize` / `registerCustomize` hooks as settle notifications.
 
 ## User controls
 
@@ -93,6 +124,9 @@ This suppresses both the default `agent_settled` notification and notifications 
 ```bash
 export PI_NOTIFY_TITLE="Pi ({folder})"
 export PI_NOTIFY_BODY="Done in {folder}: {prompt}"
+
+export PI_NOTIFY_PERMISSION_TITLE="⚠️ {permission_surface} — {session}"
+export PI_NOTIFY_PERMISSION_BODY="{permission_message}"
 ```
 
 ### Template placeholders
@@ -103,6 +137,11 @@ export PI_NOTIFY_BODY="Done in {folder}: {prompt}"
 | `{folder}`  | Basename of the working directory |
 | `{prompt}`  | Last idle interactive prompt text |
 | `{session}` | Pi session name (empty when unset) |
+| `{permission_surface}` | Permission surface (e.g. `bash`, `skill`, tool name) — permission notifications only |
+| `{permission_value}` | Command / path / skill name being gated — permission notifications only |
+| `{permission_message}` | Permission dialog message — permission notifications only |
+| `{permission_agent}` | Agent that requested the permission — permission notifications only |
+| `{permission_requester}` | Subagent name for forwarded asks, empty otherwise — permission notifications only |
 
 Unknown placeholders are left as-is. `{prompt}` is capped at 500 characters; extra `vars` passed to `pi-notify:send` override the built-ins (`{cwd}`, `{folder}`, `{prompt}`, `{session}`).
 

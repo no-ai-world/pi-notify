@@ -50,7 +50,29 @@ if (!PI_AVAILABLE) {
 	console.error("[e2e] pi binary not found on PATH — skipping real-pi e2e tests");
 }
 
-// ── helpers (no test logic here — the 8 scenarios live in the describe) ──────
+/**
+ * Tiny extension loaded alongside pi-notify in the isolated config dir: on
+ * `session_start` it broadcasts `permissions:ui_prompt` exactly like
+ * @gotgenes/pi-permission-system does before showing an ask dialog.
+ */
+const HELPER_EXTENSION = "permission-emitter.ts";
+const HELPER_EXTENSION_CONTENT = `// e2e helper: emit a permissions:ui_prompt broadcast like the permission system does.
+export default function (pi: any) {
+    pi.on("session_start", () => {
+        pi.events.emit("permissions:ui_prompt", {
+            requestId: "e2e-req-1",
+            source: "tool_call",
+            surface: "bash",
+            value: "git status",
+            agentName: null,
+            message: "Run git status in the project directory?",
+            forwarding: null,
+        });
+    });
+}
+`;
+
+// ── helpers (no test logic here — the 9 scenarios live in the describe) ──────
 
 interface RunResult {
 	stdout: string;
@@ -242,6 +264,9 @@ function piEnv(configDir: string, extraEnv: Record<string, string>): Record<stri
 	delete env.PI_NOTIFY_TITLE;
 	delete env.PI_NOTIFY_BODY;
 	delete env.PI_NOTIFY_SOUND_CMD;
+	delete env.PI_NOTIFY_FOCUS_CMD;
+	delete env.PI_NOTIFY_PERMISSION_TITLE;
+	delete env.PI_NOTIFY_PERMISSION_BODY;
 	Object.assign(env, {
 		PI_CODING_AGENT_DIR: configDir,
 		PI_OFFLINE: "1",
@@ -257,10 +282,15 @@ function piEnv(configDir: string, extraEnv: Record<string, string>): Record<stri
  * Must be async: Bun's synchronous spawnSync blocks the event loop, so the
  * in-process mock HTTP server could never answer pi's LLM requests (dead-
  * lock). Async spawn leaves the loop free. */
-async function runPi(configDir: string, messages: string[], extraEnv: Record<string, string> = {}): Promise<RunResult> {
+async function runPi(
+	configDir: string,
+	messages: string[],
+	extraEnv: Record<string, string> = {},
+	extraExtensions: string[] = [],
+): Promise<RunResult> {
 	const args = [
 		"-p",
-		"-ne", // no extension discovery — only the explicit -e path loads
+		"-ne", // no extension discovery — only the explicit -e paths load
 		"-nc", // no AGENTS.md / context files
 		"-nt", // no tools — the mock LLM never calls any anyway
 		"--offline",
@@ -268,6 +298,7 @@ async function runPi(configDir: string, messages: string[], extraEnv: Record<str
 		"--model", "mock-1",
 		"--api-key", "dummy-key",
 		"-e", EXTENSION,
+		...extraExtensions.flatMap((ext) => ["-e", path.join(configDir, ext)]),
 		"--name", PI_NAME,
 		...messages,
 	];
@@ -317,6 +348,7 @@ describe.skipIf(!PI_AVAILABLE)("pi-notify e2e (real pi)", () => {
 		configDir = mkdtempSync(path.join(tmpdir(), "pi-notify-e2e-"));
 		mock = await startMockServer();
 		writeIsolatedConfig(configDir, mock.port);
+		writeFileSync(path.join(configDir, HELPER_EXTENSION), HELPER_EXTENSION_CONTENT);
 	}, 30_000);
 
 	afterAll(() => {
@@ -334,6 +366,23 @@ describe.skipIf(!PI_AVAILABLE)("pi-notify e2e (real pi)", () => {
 			const [title, body] = osc[0].split(";");
 			expect(title).toBe("Pi — e2e-test");
 			expect(body).toBe('Done: "Say hello"');
+		},
+		{ timeout: RUN_TIMEOUT_MS },
+	);
+
+	test(
+		"permissions:ui_prompt broadcasts an approval notification",
+		async () => {
+			// The helper extension emits the broadcast on session_start, before
+			// the agent run; the permission notify then starts the cooldown, so
+			// the later settle is deduped and only one OSC payload appears.
+			const run = await runPi(configDir, ["Say hello"], {}, [HELPER_EXTENSION]);
+			expect(run.exitCode, run.stderr.slice(0, 2000)).toBe(0);
+			const osc = parseOsc777(run.stderr);
+			expect(osc.length, run.stderr.slice(0, 2000)).toBe(1);
+			const [title, body] = osc[0].split(";");
+			expect(title).toBe("Pi needs approval — e2e-test");
+			expect(body).toBe("Run git status in the project directory?");
 		},
 		{ timeout: RUN_TIMEOUT_MS },
 	);
