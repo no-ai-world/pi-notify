@@ -19,6 +19,7 @@ import registerExtension, {
 	toastImageSrc,
 	runHandlers,
 	registerCustomize,
+	tryReadRunnerBound,
 	ENGAGEMENT_MS,
 	COOLDOWN_MS,
 	type PermissionUiPromptEvent,
@@ -652,4 +653,23 @@ test("shouldNotify: cooldown exactly COOLDOWN_MS ago allows notification", () =>
 	s.lastNotifiedAt = 1_000_000;
 	const result = shouldNotify(s, 1_000_000 + COOLDOWN_MS, () => false);
 	expect(result).toBe(true);
+});
+
+test("tryReadRunnerBound: live runner reads pass through", () => {
+	const result = tryReadRunnerBound(() => "C:\\work\\pi-notify");
+	expect(result).toBe("C:\\work\\pi-notify");
+});
+
+test("tryReadRunnerBound: invalidated runner reads return undefined", () => {
+	const staleRead = () => {
+		throw new Error("This extension ctx is stale after session replacement or reload.");
+	};
+	expect(tryReadRunnerBound(staleRead)).toBeUndefined();
+});
+
+test("tryReadRunnerBound: unrelated read errors are rethrown", () => {
+	const failingRead = () => {
+		throw new Error("boom");
+	};
+	expect(() => tryReadRunnerBound(failingRead)).toThrow("boom");
 });

@@ -475,6 +475,28 @@ export async function runHandlers<T>(
 	}
 }
 
+/**
+ * Prefix of the error thrown by an extension runner invalidated by a session replacement or reload.
+ * Keep in sync with the pi bump: a reworded message makes stale reads fail loud again.
+ */
+const STALE_CTX_PREFIX = "This extension ctx is stale after session replacement or reload";
+
+/**
+ * Read a runner-bound value that may be unavailable: a session replacement or
+ * reload invalidates the extension runner, so its ctx/api reads throw a known
+ * stale-ctx error. Returns undefined for that exact error so handlers can skip
+ * or degrade cleanly; any other error is rethrown to stay visible.
+ */
+export function tryReadRunnerBound<T>(read: () => T): T | undefined {
+	// 仅放行会话替换/重载导致的已知 stale 错误，其余读取错误照抛
+	try {
+		return read();
+	} catch (err) {
+		if (err instanceof Error && err.message.startsWith(STALE_CTX_PREFIX)) return undefined;
+		throw err;
+	}
+}
+
 /** Apply legacy synchronous bus hooks and awaited registered customizers. */
 export async function applyCustomizations(
 	events: ExtensionAPI["events"],
@@ -555,7 +577,7 @@ export default function (pi: ExtensionAPI) {
 		// 处理扩展触发的主动通知
 		if (disposed) return;
 
-		const sessionName = pi.getSessionName();
+		const sessionName = tryReadRunnerBound(() => pi.getSessionName());
 		const cwd = latestCwd || process.cwd();
 		const folder = path.basename(cwd);
 		const vars = builtInVars({
@@ -582,7 +604,7 @@ export default function (pi: ExtensionAPI) {
 		if (!isPermissionUiPrompt(data)) return;
 		if (isFocused()) return; // the ask dialog is already visible to the user
 
-		const sessionName = pi.getSessionName();
+		const sessionName = tryReadRunnerBound(() => pi.getSessionName());
 		const cwd = latestCwd || process.cwd();
 		const folder = path.basename(cwd);
 		const vars = {
@@ -687,13 +709,17 @@ export default function (pi: ExtensionAPI) {
 
 	// agent_settled = no retry / compaction / queued follow-up left (true idle).
 	pi.on("agent_settled", async (_event, ctx) => {
-		latestCwd = ctx.cwd;
+		// A session replacement (newSession/fork/switchSession/reload) invalidates
+		// the runner mid-run; the leftover settled event then throws on ctx reads.
+		// The user is actively switching sessions, so the notification is noise.
+		const cwd = tryReadRunnerBound(() => ctx.cwd);
+		if (cwd === undefined) return;
+		latestCwd = cwd;
+		const sessionName = tryReadRunnerBound(() => pi.getSessionName());
 
 		const now = Date.now();
 		if (!shouldNotify(state, now, isFocused)) return;
 
-		const sessionName = pi.getSessionName();
-		const cwd = ctx.cwd;
 		const folder = path.basename(cwd);
 		const vars = builtInVars({
 			cwd,
