@@ -10,6 +10,7 @@ import registerExtension, {
 	buildTitle,
 	buildPermissionTitle,
 	buildPermissionBody,
+	cleanPermissionMessage,
 	permissionVars,
 	isPermissionUiPrompt,
 	resolveTemplates,
@@ -22,6 +23,7 @@ import registerExtension, {
 	tryReadRunnerBound,
 	ENGAGEMENT_MS,
 	COOLDOWN_MS,
+	PERMISSION_BODY_MAX,
 	type PermissionUiPromptEvent,
 } from "./index.ts";
 
@@ -52,11 +54,11 @@ function permissionPrompt(over: Partial<PermissionUiPromptEvent> = {}): Permissi
 // --- buildPermissionTitle ---
 
 test("buildPermissionTitle: no who/session falls back to the generic ask", () => {
-	expect(buildPermissionTitle(permissionPrompt())).toBe("Pi needs approval");
+	expect(buildPermissionTitle(permissionPrompt())).toBe("Pi PA");
 });
 
 test("buildPermissionTitle: agentName is shown in the title", () => {
-	expect(buildPermissionTitle(permissionPrompt({ agentName: "Coder" }))).toBe("Pi needs approval (Coder)");
+	expect(buildPermissionTitle(permissionPrompt({ agentName: "Coder" }))).toBe("Pi PA (Coder)");
 });
 
 test("buildPermissionTitle: forwarded requester wins over agentName", () => {
@@ -64,23 +66,52 @@ test("buildPermissionTitle: forwarded requester wins over agentName", () => {
 		buildPermissionTitle(
 			permissionPrompt({ agentName: "Coder", forwarding: { requesterAgentName: "Explore", requesterSessionId: "s-1" } }),
 		),
-	).toBe("Pi needs approval (Explore)");
+	).toBe("Pi PA (Explore)");
 });
 
 test("buildPermissionTitle: session name is appended when present", () => {
 	expect(buildPermissionTitle(permissionPrompt({ agentName: "Coder" }), "my-project")).toBe(
-		"Pi needs approval (Coder) — my-project",
+		"Pi PA (Coder) — my-project",
+	);
+});
+
+test("buildPermissionTitle: folder is used when who/session are missing", () => {
+	expect(buildPermissionTitle(permissionPrompt(), undefined, "my-project")).toBe("Pi PA (my-project)");
+});
+
+test("buildPermissionTitle: session name wins over folder", () => {
+	expect(buildPermissionTitle(permissionPrompt(), "sess", "folder")).toBe("Pi PA — sess");
+});
+
+test("buildPermissionTitle: who wins over session and folder", () => {
+	expect(buildPermissionTitle(permissionPrompt({ agentName: "Coder" }), "sess", "folder")).toBe(
+		"Pi PA (Coder) — sess",
 	);
 });
 
 // --- buildPermissionBody ---
 
-test("buildPermissionBody: uses the dialog message when present", () => {
-	expect(buildPermissionBody(permissionPrompt({ message: "Run this command?" }))).toBe("Run this command?");
+test("buildPermissionBody: surface + value win over the dialog message", () => {
+	expect(buildPermissionBody(permissionPrompt({ message: "Run it?" }))).toBe("bash: git status");
+	expect(buildPermissionBody(permissionPrompt())).toBe("bash: git status");
 });
 
-test("buildPermissionBody: falls back to surface + value", () => {
-	expect(buildPermissionBody(permissionPrompt())).toBe("bash: git status");
+test("buildPermissionBody: value equal to surface falls through to the message", () => {
+	expect(buildPermissionBody(permissionPrompt({ surface: "bash", value: "bash", message: "Run it?" }))).toBe(
+		"Run it?",
+	);
+});
+
+test("buildPermissionBody: cleaned message when surface/value are missing", () => {
+	expect(
+		buildPermissionBody(
+			permissionPrompt({
+				surface: null,
+				value: null,
+				message: "Current agent requested bash command 'git status'. Allow this command?",
+			}),
+		),
+	).toBe("bash command 'git status'");
 });
 
 test("buildPermissionBody: generic fallback when nothing is known", () => {
@@ -89,8 +120,54 @@ test("buildPermissionBody: generic fallback when nothing is known", () => {
 	);
 });
 
-test("buildPermissionBody: long messages are truncated to 160 chars", () => {
-	expect(buildPermissionBody(permissionPrompt({ message: "x".repeat(200) }))).toBe("x".repeat(159) + "…");
+test("buildPermissionBody: value without surface falls back to a permission label", () => {
+	expect(buildPermissionBody(permissionPrompt({ surface: null, value: "git status" }))).toBe(
+		"permission: git status",
+	);
+});
+
+test("buildPermissionBody: long values are truncated to 160 chars", () => {
+	const label = "bash";
+	const budget = PERMISSION_BODY_MAX - label.length - 2;
+	expect(buildPermissionBody(permissionPrompt({ value: "x".repeat(200) }))).toBe(
+		`${label}: ` + "x".repeat(budget - 1) + "…",
+	);
+});
+
+// --- cleanPermissionMessage ---
+
+test("cleanPermissionMessage: strips subject prefix, matched noise, and allow-question", () => {
+	expect(
+		cleanPermissionMessage(
+			"Agent 'Coder' requested bash command 'xargs wc -l (matched'<indirection-bash-wrapper>')(full command: 'cd /d/Applications'). Allow this command?",
+		),
+	).toBe("bash command 'xargs wc -l (full command: 'cd /d/Applications')");
+});
+
+test("cleanPermissionMessage: skill-read 'access to' preamble is stripped", () => {
+	expect(
+		cleanPermissionMessage(
+			"Agent 'Coder' requested access to skill 'review' via 'docs/review.md'. Allow this read?",
+		),
+	).toBe("skill 'review' via 'docs/review.md'");
+});
+
+test("cleanPermissionMessage: lowercase 'allow' prose is left intact", () => {
+	expect(cleanPermissionMessage("Check the log file. allow me to verify the tail.")).toBe(
+		"Check the log file. allow me to verify the tail.",
+	);
+});
+
+test("cleanPermissionMessage: subagent preamble is stripped, prose collapsed", () => {
+	expect(cleanPermissionMessage("Subagent 'Explore' requested permission.\nSession ID: s-1\n\nRun git status?")).toBe(
+		"permission. Session ID: s-1 Run git status?",
+	);
+});
+
+test("cleanPermissionMessage: non-string or empty input becomes empty", () => {
+	expect(cleanPermissionMessage(123 as unknown as string)).toBe("");
+	expect(cleanPermissionMessage(null as unknown as string)).toBe("");
+	expect(cleanPermissionMessage("   ")).toBe("");
 });
 
 // --- permissionVars ---
@@ -505,8 +582,8 @@ test("extension: permissions:ui_prompt sends a notification with ask content", a
 		await new Promise((r) => setTimeout(r, 0));
 		expect(writes).toHaveLength(1);
 		expect(fired).toHaveLength(1);
-		expect(fired[0].title).toBe("Pi needs approval");
-		expect(fired[0].body).toBe("Run it?");
+		expect(fired[0].title).toBe("Pi PA (pi-notify)");
+		expect(fired[0].body).toBe("bash: git status");
 	});
 });
 

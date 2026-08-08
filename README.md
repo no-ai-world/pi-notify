@@ -82,8 +82,8 @@ pi install npm:@gotgenes/pi-permission-system
 
 Default content:
 
-- **Title:** `Pi needs approval`, plus the requesting agent when known (`Pi needs approval (Explore)`) and the session name (`Pi needs approval — my-project`)
-- **Body:** the dialog message (truncated to 160 characters), falling back to `bash: git status` (surface + value), then to `A permission decision is required.`
+- **Title:** `Pi PA`, plus the requesting agent when known (`Pi PA (Explore)`) and the session name or project folder (`Pi PA — my-project` / `Pi PA (my-project)`; folder covers the common case where pi never wrote a session name)
+- **Body:** the gated surface and value (`bash: git status`), falling back to the dialog message cleaned of its request preamble and “Allow this …?” phrasing (truncated to 160 characters), then to `A permission decision is required.`
 
 Suppression semantics differ from `agent_settled` notifications:
 

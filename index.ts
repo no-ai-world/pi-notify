@@ -90,7 +90,7 @@ export const ENGAGEMENT_MS = 15_000;
 const PROMPT_VAR_MAX = 500;
 
 /** Cap for permission notification body text, keeping toasts compact. */
-const PERMISSION_BODY_MAX = 160;
+export const PERMISSION_BODY_MAX = 160;
 
 /**
  * Shape of the `permissions:ui_prompt` event broadcast by
@@ -389,24 +389,53 @@ function truncateText(text: string, max: number): string {
 }
 
 /** Build the default notification title for a permission prompt. */
-export function buildPermissionTitle(event: PermissionUiPromptEvent, sessionName?: string): string {
-	// 根据权限提示构建默认通知标题
+export function buildPermissionTitle(
+	event: PermissionUiPromptEvent,
+	sessionName?: string,
+	folder?: string,
+): string {
+	// 根据权限提示构建默认通知标题（who → session → folder 兜底链）
 	const who = event.forwarding?.requesterAgentName ?? event.agentName;
-	const base = who ? `Pi needs approval (${who})` : "Pi needs approval";
-	return sessionName ? `${base} — ${sessionName}` : base;
+	const base = who ? `Pi PA (${who})` : "Pi PA";
+	if (sessionName) return `${base} — ${sessionName}`;
+	if (folder) return `${base} (${folder})`;
+	return base;
+}
+
+/**
+ * Strip dialog-oriented prose from a permission ask message, keeping the
+ * factual core: removes the subject preamble ("Current agent requested …"),
+ * the trailing allow-question ("… Allow this command?"), and matched-rule
+ * noise from the permission system's internal patterns.
+ */
+export function cleanPermissionMessage(raw: unknown): string {
+	// 清洗权限对话框散文，保留事实部分（主语前缀/提问后缀/内部规则噪音）
+	if (typeof raw !== "string") return "";
+	let text = raw.trim();
+	if (!text) return "";
+	text = text
+		.replace(/^(?:current agent|agent '[^']*'|subagent(?: '[^']*')?)\s+requested\s+(?:access to\s+)?/i, "")
+		.replace(/\(matched ?'[^']*'\)\s*/g, "")
+		.replace(/\s*\.\s*Allow [^.]+$/, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	return text;
 }
 
 /** Build the default notification body for a permission prompt. */
 export function buildPermissionBody(event: PermissionUiPromptEvent): string {
-	// 根据权限提示构建默认通知正文（跨扩展载荷，字段防御性读取）
-	const message = typeof event.message === "string" ? event.message.trim() : "";
-	if (message) return truncateText(message, PERMISSION_BODY_MAX);
-	const surface = typeof event.surface === "string" ? event.surface : "permission";
+	// 优先 surface:value 紧凑呈现，message 清洗后兜底（跨扩展载荷，字段防御性读取）
+	const surface = typeof event.surface === "string" ? event.surface.trim() : "";
 	const value = typeof event.value === "string" ? event.value.trim() : "";
 	if (value) {
-		const budget = Math.max(1, PERMISSION_BODY_MAX - surface.length - 2);
-		return `${surface}: ${truncateText(value, budget)}`;
+		const label = surface || "permission";
+		if (label !== value) {
+			const budget = Math.max(1, PERMISSION_BODY_MAX - label.length - 2);
+			return `${label}: ${truncateText(value, budget)}`;
+		}
 	}
+	const message = cleanPermissionMessage(event.message);
+	if (message) return truncateText(message, PERMISSION_BODY_MAX);
 	return "A permission decision is required.";
 }
 
@@ -613,7 +642,7 @@ export default function (pi: ExtensionAPI) {
 		};
 
 		const sent = await notify(
-			process.env.PI_NOTIFY_PERMISSION_TITLE ?? buildPermissionTitle(data, sessionName),
+			process.env.PI_NOTIFY_PERMISSION_TITLE ?? buildPermissionTitle(data, sessionName, folder),
 			process.env.PI_NOTIFY_PERMISSION_BODY ?? buildPermissionBody(data),
 			vars,
 		);

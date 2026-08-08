@@ -381,8 +381,8 @@ describe.skipIf(!PI_AVAILABLE)("pi-notify e2e (real pi)", () => {
 			const osc = parseOsc777(run.stderr);
 			expect(osc.length, run.stderr.slice(0, 2000)).toBe(1);
 			const [title, body] = osc[0].split(";");
-			expect(title).toBe("Pi needs approval — e2e-test");
-			expect(body).toBe("Run git status in the project directory?");
+			expect(title).toBe("Pi PA — e2e-test");
+			expect(body).toBe("bash: git status");
 		},
 		{ timeout: RUN_TIMEOUT_MS },
 	);
