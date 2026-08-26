@@ -12,7 +12,7 @@ A [Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) extension 
 | rxvt-unicode                   | ✓       | OSC 777                         |
 | Kitty                          | ✓       | OSC 99                          |
 | tmux (inside a supported term) | ✓*      | tmux passthrough + OSC 777/99/9 |
-| Windows Terminal               | ✓       | PowerShell toast (+ icon)       |
+| Windows Terminal / WSL         | ✓       | PowerShell toast (+ icon)       |
 | Terminal.app                   | ✗       | —                               |
 | Alacritty                      | ✗       | —                               |
 
@@ -44,7 +44,7 @@ When Pi fully settles (`agent_settled` — no retry, compaction, or queued follo
 - **OSC 9** (iTerm2): iTerm2 notification protocol, detected via `TERM_PROGRAM=iTerm.app`
 - **OSC 99** (Kitty): Kitty's notification protocol, detected via `KITTY_WINDOW_ID`
 - **tmux passthrough**: OSC sequences are wrapped automatically when `TMUX` is set
-- **Windows toast** (Windows Terminal via `WT_SESSION`): PowerShell notification with `logo.png` when resolvable beside the extension
+- **Windows toast** (Windows Terminal or WSL): PowerShell notification with `logo.png` when resolvable beside the extension
 
 Clicking the notification focuses the terminal window/tab.
 
@@ -279,6 +279,26 @@ If `PI_NOTIFY_FOCUS_CMD` is unset, focus detection is skipped and the cooldown +
 OSC = Operating System Command, part of ANSI escape sequences. Terminals use these for things beyond text formatting (change title, colors, notifications, etc.).
 
 `777` is the number rxvt-unicode picked for notifications. Ghostty and WezTerm adopted it. iTerm2 uses `9` instead, and Kitty uses `99` with a more extensible protocol.
+
+## WSL troubleshooting
+
+WSL does not display OSC notifications itself, so pi-notify automatically uses the Windows toast path in WSL (even when `WT_SESSION` was removed by an environment wrapper). Windows interop must be enabled and one of the following commands must work:
+
+```bash
+powershell.exe -NoProfile -NonInteractive -Command 'Write-Output interop-ok'
+# or
+pwsh.exe -NoProfile -NonInteractive -Command 'Write-Output interop-ok'
+```
+
+If neither command is found, enable WSL interop in `/etc/wsl.conf` and restart WSL:
+
+```ini
+[interop]
+enabled=true
+appendWindowsPath=true
+```
+
+Also check Windows **Settings → System → Notifications** and make sure notifications and banners are enabled. `PI_NOTIFY_FOCUS_CMD` must not exit 0 while the terminal is focused, otherwise the notification is intentionally suppressed.
 
 ## Known Limitations
 

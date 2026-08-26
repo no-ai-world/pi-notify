@@ -17,6 +17,9 @@ import registerExtension, {
 	sanitizeOscText,
 	stripControlChars,
 	resolveIconPath,
+	isWSL,
+	notifyWindows,
+	windowsToastScript,
 	toastImageSrc,
 	runHandlers,
 	registerCustomize,
@@ -319,6 +322,42 @@ test("resolveIconPath: missing file returns undefined", () => {
 	expect(resolveIconPath("definitely-missing-icon-xyz.png")).toBeUndefined();
 });
 
+// --- WSL detection ---
+
+test("isWSL: recognizes WSL markers only on Linux", () => {
+	expect(isWSL({ WSL_DISTRO_NAME: "Ubuntu" }, "linux")).toBe(true);
+	expect(isWSL({ WSL_INTEROP: "/run/WSL/1_interop" }, "linux")).toBe(true);
+	expect(isWSL({ WSL_DISTRO_NAME: "Ubuntu" }, "win32")).toBe(false);
+	expect(isWSL({}, "linux")).toBe(false);
+});
+
+// --- windowsToastScript ---
+
+test("windowsToastScript: uses a registered AppUserModelID", () => {
+	const script = windowsToastScript("title", "body");
+	expect(script).toContain("CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe')");
+	expect(script).not.toContain("CreateToastNotifier('Pi Agent')");
+});
+
+test("notifyWindows: falls back from Windows PowerShell to pwsh", () => {
+	const savedDistro = process.env.WSL_DISTRO_NAME;
+	process.env.WSL_DISTRO_NAME = "Ubuntu";
+	const calls: Array<{ file: string; args: string[] }> = [];
+
+	try {
+		notifyWindows("title", "body", undefined, (file, args, callback) => {
+			calls.push({ file, args });
+			callback(file === "powershell.exe" ? new Error("not available") : null);
+		});
+	} finally {
+		if (savedDistro === undefined) delete process.env.WSL_DISTRO_NAME;
+		else process.env.WSL_DISTRO_NAME = savedDistro;
+	}
+
+	expect(calls.map(({ file }) => file)).toEqual(["powershell.exe", "pwsh.exe"]);
+	expect(calls[0].args.slice(0, 3)).toEqual(["-NoProfile", "-NonInteractive", "-Command"]);
+});
+
 // --- toastImageSrc ---
 
 test("toastImageSrc: converts a Windows drive path to a file URI", () => {
@@ -401,6 +440,9 @@ async function withIsolatedTransport(fn: (writes: unknown[][]) => Promise<void>)
 	// 隔离通知传输：屏蔽终端环境变量并捕获 stdout 写入
 	const envKeys = [
 		"WT_SESSION",
+		"WSLENV",
+		"WSL_DISTRO_NAME",
+		"WSL_INTEROP",
 		"KITTY_WINDOW_ID",
 		"TERM_PROGRAM",
 		"ITERM_SESSION_ID",

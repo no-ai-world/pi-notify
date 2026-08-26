@@ -161,9 +161,13 @@ function extensionDirCandidates(): string[] {
 	return [...new Set(dirs)];
 }
 
-function isWSL(): boolean {
-	// 判断当前是否运行在 WSL
-	return Boolean(process.env.WSLENV) || (process.platform === "linux" && Boolean(process.env.WSL_DISTRO_NAME));
+/** Return true when the current process is running inside WSL. */
+export function isWSL(
+	env: Record<string, string | undefined> = process.env,
+	platform: string = process.platform,
+): boolean {
+	// WSLENV is also inherited by child processes launched from Windows Terminal.
+	return Boolean(env.WSL_INTEROP || env.WSL_DISTRO_NAME || env.WSLENV) && platform === "linux";
 }
 
 export function resolveIconPath(iconRelative: string = "logo.png"): string | undefined {
@@ -180,10 +184,14 @@ export function resolveIconPath(iconRelative: string = "logo.png"): string | und
 
 	if (isWSL()) {
 		try {
-			return execFileSync("wslpath", ["-w", localPath], { encoding: "utf8" }).trim();
+			const windowsPath = execFileSync("wslpath", ["-w", localPath], { encoding: "utf8" }).trim();
+			// A Linux path is not a valid URI for the Windows toast API. If wslpath
+			// is unavailable, omit the icon and let the text-only toast continue.
+			if (/^(?:[A-Za-z]:[\\\\]|\\\\\\\\)/.test(windowsPath)) return windowsPath;
 		} catch {
-			return localPath;
+			// The icon is optional; keep notification delivery independent of wslpath.
 		}
+		return undefined;
 	}
 
 	return localPath;
@@ -196,7 +204,7 @@ function escapePowerShellSingleQuoted(value: string): string {
 
 // ── Notification transport ────────────────────────────────────────────────────
 
-function windowsToastScript(title: string, body: string, iconPath: string = ""): string {
+export function windowsToastScript(title: string, body: string, iconPath: string = ""): string {
 	// 生成 Windows toast 的 PowerShell 脚本
 	const type = "Windows.UI.Notifications";
 	const mgr = `[${type}.ToastNotificationManager, ${type}, ContentType = WindowsRuntime]`;
@@ -204,6 +212,11 @@ function windowsToastScript(title: string, body: string, iconPath: string = ""):
 	const template = `[${type}.ToastTemplateType]::${templateType}`;
 	const safeTitle = escapePowerShellSingleQuoted(title);
 	const safeBody = escapePowerShellSingleQuoted(body);
+
+	// CreateToastNotifier expects an AppUserModelID, not a display name. The
+	// Windows PowerShell executable has a stable registered desktop AUMID and is
+	// available on supported Windows installations, including when called from WSL.
+	const appId = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
 
 	const script = [
 		`${mgr} | Out-Null`,
@@ -221,7 +234,7 @@ function windowsToastScript(title: string, body: string, iconPath: string = ""):
 	}
 
 	script.push(
-		`[${type}.ToastNotificationManager]::CreateToastNotifier('Pi Agent').Show([${type}.ToastNotification]::new($t))`,
+		`[${type}.ToastNotificationManager]::CreateToastNotifier('${appId}').Show([${type}.ToastNotification]::new($t))`,
 	);
 
 	return script.join("; ");
@@ -254,21 +267,47 @@ function notifyOSC99(title: string, body: string): void {
 	process.stdout.write(wrapForTmux(bodySequence));
 }
 
-function notifyWindows(title: string, body: string, iconPath?: string): void {
+type ExecFileRunner = (
+	file: string,
+	args: string[],
+	callback: (error: Error | null) => void,
+) => void;
+
+const runExecFile: ExecFileRunner = (file, args, callback) => {
+	execFile(file, args, (error) => callback(error));
+};
+
+export function notifyWindows(
+	title: string,
+	body: string,
+	iconPath?: string,
+	run: ExecFileRunner = runExecFile,
+): void {
 	// 通过 PowerShell toast 发送 Windows 通知
-	const args = ["-NoProfile", "-Command", windowsToastScript(title, body, iconPath ?? "")];
+	const args = ["-NoProfile", "-NonInteractive", "-Command", windowsToastScript(title, body, iconPath ?? "")];
 
-	// WSL interop needs the .exe suffix; plain Windows resolves either way.
-	const pwshBinary = process.platform === "win32" || isWSL() ? "pwsh.exe" : "pwsh";
+	// Windows PowerShell 5.1 is the most compatible host for the legacy WinRT
+	// toast API. Prefer it in WSL; pwsh.exe remains a fallback for machines that
+	// do not expose Windows PowerShell through interop.
+	const binaries = isWSL()
+		? ["powershell.exe", "pwsh.exe"]
+		: process.platform === "win32"
+			? ["powershell.exe", "pwsh.exe"]
+			: ["pwsh", "powershell.exe"];
 
-	// Try pwsh first; fall back to Windows PowerShell. Only surface a single
-	// error when both fail, so a broken toast doesn't spam the session log.
-	execFile(pwshBinary, args, (pwshErr) => {
-		if (!pwshErr) return;
-		execFile("powershell.exe", args, (psErr) => {
-			if (psErr) console.error("pi-notify windows toast failed (pwsh + powershell.exe):", psErr);
+	const tryNext = (index: number, previousError?: unknown): void => {
+		const binary = binaries[index];
+		if (!binary) {
+			console.error("pi-notify windows toast failed:", previousError);
+			return;
+		}
+		run(binary, args, (err) => {
+			if (!err) return;
+			tryNext(index + 1, err);
 		});
-	});
+	};
+
+	tryNext(0);
 }
 
 function runSoundHook(): void {
@@ -292,7 +331,9 @@ function sendNotification(title: string, body: string, iconPath?: string): void 
 	// 按终端环境选择通知投递通道
 	const isIterm2 = process.env.TERM_PROGRAM === "iTerm.app" || Boolean(process.env.ITERM_SESSION_ID);
 
-	if (process.env.WT_SESSION) {
+	// WSL does not consume OSC notifications itself. Prefer Windows toast for
+	// every WSL launch, even when WT_SESSION was stripped by an env wrapper.
+	if (process.env.WT_SESSION || isWSL()) {
 		// Toast text is PowerShell-escaped; only strip controls, keep ';' in prose.
 		const winTitle = stripControlChars(title).replace(/\s+/g, " ").trim() || "Pi";
 		const winBody = stripControlChars(body).replace(/\s+/g, " ").trim() || "Ready for input";
